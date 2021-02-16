@@ -8,3 +8,4 @@ RUN apt update && \
         python3-pip \
         pypy3 && \
     pypy3 -m pip install docopt
+ADD pully /usr/local/bin
