@@ -1,0 +1,602 @@
+#!/usr/bin/env pypy3
+"""pully - in silico pulldown of genes, exons, reads
+
+Usage:
+    pully genes [options] <genome> <annotation>
+    pully exons [options] <genome> <annotation>
+    pully filter [options] <sequences>
+    pully read-pairs [options] <baits> <output-prefix> (<fastq1> <fastq2>)...
+
+Options:
+    -K <K>                          k-mer size [default: 25].
+    -c <C>, --max-count <C>         maximum count for k-mer filtering.
+    -e <E>, --entropy <E>           minimum per-base entropy for k-mer filtering.
+    -g <path>, --genome <path>      pathname for genome for filtering
+    -h <path>, --histogram <path>   write out a histogram of k-mers.
+    -l <attrs>, --label <attrs>     attributes to label output sequences.
+    -o <file>, --output <file>      specify an output file [default: -].
+    -p <path>, --prefix <path>      specify a path prefix for multiple output files.
+    -r <loci>, --regions <loci>     a list of comma separated regions to restrict features to.
+    -S <N>, --seed <N>              set a seed for sampling [default: 42].
+    -s <P>, --sample <P>            sample with probability P.
+    -t <path>, --stats <path>       write out statistics about the pulldown.
+    -u <suf>, --suffix <suf>        suffix for output sequence read filenames [default: .fastq].
+    -v --verbose                    produce verbose progress output
+"""
+import docopt
+import gzip
+import hashlib
+import json
+import math
+import re
+import sys
+
+class sampler(object):
+    def __init__(self, seed : str, prob : float):
+        self.seed = seed.encode('utf-8')
+        self.prob = prob
+
+    def __getitem__(self, item : str):
+        m = hashlib.sha256()
+        m.update(self.seed)
+        m.update(item.encode('utf-8'))
+        d = m.digest()
+        x = 0.0
+        for i in range(8):
+            x = (x / 256.0) + float(d[i]) / 256.0
+        return x < self.prob
+
+class interval(object):
+    def __init__(self, begin, end):
+        self.begin = begin
+        self.end = end
+
+    def __contains__(self, x):
+        return self.begin <= x and x <= self.end
+
+class regions(object):
+    def __init__(self, spec : str):
+        self.chroms = set([])
+        self.zones = {}
+        for s in spec.split(','):
+            m = re.match("([^:]+):([0-9]+)([+-])([0-9]+)$", s)
+            if m:
+                chrom = m.groups()[0]
+                start = int(m.groups()[1])
+                extender = m.groups()[2]
+                end = int(m.groups()[3])
+                if extender == "+":
+                    end += start
+                if chrom not in self.zones:
+                    self.zones[chrom] = []
+                self.zones[chrom].append(interval(start,end))
+                continue
+
+            m = re.match("([^:]+):([0-9]+)$", s)
+            if m:
+                chrom = m.groups()[0]
+                start = int(m.groups()[1])
+                if chrom not in self.zones:
+                    self.zones[chrom] = []
+                self.zones[chrom].append(interval(start,start))
+                continue
+
+            self.chroms.add(s)
+
+    def __contains__(self, loc):
+        if loc in self.chroms:
+            return True
+        (chrom, start, end) = loc
+        if chrom in self.chroms:
+            return True
+        if chrom not in self.zones:
+            return False
+        this = interval(start, end)
+        for other in self.zones[chrom]:
+            if this.begin in other or this.end in other or other.begin in this or other.end in this:
+                return True
+        return False
+
+def lcp(s, t):
+    i = 0
+    while i < len(s) and i < len(t) and s[i] == t[i]:
+        i += 1
+    return s[:i]
+
+def make_value(s):
+    if s.startswith('"') and s.endswith('"'):
+        return s[1:-1]
+    try:
+        i = int(s)
+        return i
+    except:
+        pass
+    try:
+        f = float(s)
+        return f
+    except:
+        pass
+    return s
+
+class feature(object):
+    def __init__(self, tup):
+        self.chrom = tup[0]
+        self.source = tup[1]
+        self.type = tup[2]
+        try:
+            self.start = int(tup[3])
+        except:
+            self.start = None
+        try:
+            self.end = int(tup[4])
+        except:
+            self.end = None
+        try:
+            self.score = float(tup[5])
+        except:
+            self.score = None
+        self.strand = tup[6]
+        try:
+            self.frame = int(tup[7])
+        except:
+            self.frame = None
+        self.attributes = tup[8]
+
+class labeller(object):
+    def __init__(self, lab_fmt : str):
+        self.lab_fmt = lab_fmt
+
+    def __getitem__(self, ftr):
+        ftr_map = {}
+        ftr_map['chrom'] = ftr.chrom
+        ftr_map['start'] = ftr.start
+        ftr_map['end'] = ftr.end
+        ftr_map['score'] = ftr.score
+        ftr_map['frame'] = ftr.frame
+        for nm in ftr.attributes.keys():
+            ftr_map[nm] = ftr.attributes[nm]
+        return self.lab_fmt.format(**ftr_map)
+
+def read_gtf(f):
+    for l in f:
+        if l.startswith('#'):
+            continue
+        t = list(l.strip().split('\t'))
+        atts = {}
+        for s in t[8].split(';'):
+            s = s.strip()
+            if len(s) == 0:
+                continue
+            u = s.split(' ')
+            atts[u[0]] = make_value(u[1])
+        t[8] = atts
+        yield feature(t)
+
+def readFasta(file):
+    """
+    Read textual input from the file object `file`, which is assumed to
+    be in FASTA format.  Yields the sequence of (name, sequence) tuples.
+    """
+    nm = None
+    seq = []
+    for l in file:
+        l = l.strip()
+        if len(l) and l[0] == '>':
+            if nm is not None:
+                yield (nm, ''.join(seq))
+            nm = l[1:].strip()
+            seq = []
+        else:
+            seq.append(l)
+    if nm is not None:
+        yield (nm, ''.join(seq))
+
+def readFastq(file):
+    """
+    Read textual input from the file object `file`, which is assumed
+    to be in line-oriented FASTQ format (not full multi-line FASTQ).
+    Yields the sequence of (name, sequence, label, quality) tuples.
+    """
+    grp = []
+    for l in file:
+        l = l.strip()
+        grp.append(l)
+        if len(grp) == 4:
+            yield tuple(grp)
+            grp = []
+    if grp == 4:
+        yield tuple(grp)
+
+def writeFastq(out, grp):
+    print(grp[0], file=out)
+    print(grp[1], file=out)
+    print(grp[2], file=out)
+    print(grp[3], file=out)
+
+_nuc = { 'A':0, 'a':0, 'C':1, 'c':1, 'G':2, 'g':2, 'T':3, 't':3, 'U':3, 'u':3 }
+_nucList = [None for i in range(256)]
+for (c,v) in _nuc.items():
+    _nucList[ord(c)] = v
+_nucTup = tuple(_nucList)
+
+def kmers(k, seq, bothStrands=False):
+    """
+    A generator for extracting *k*-mers from a string nucleotide
+    sequence `seq`.  The parameter `bothStrands` determines whether
+    the sequence of result *k*-mers should include the reverse
+    complement of each *k*-mer extracted from the string.
+
+    The *k*-mers are extracted using a *sliding* window, not a *tiling*
+    window.  This means that the results include the *k*-mer starting
+    at each position in the string: 0, 1, 2, ...., len(str) - k + 1.
+
+    Any *k*-mers overlaying characters *other* than AaCcGgTtUu are skipped.
+
+    Values of `k` > 30 are not guaranteed to work.
+    """
+    z = len(seq)
+    msk = (1 << (2*k)) - 1
+    s = 2*(k-1)
+    i = 0
+    j = 0
+    x = 0
+    xb = 0
+    while i + k <= z:
+        while i + j < z and j < k:
+            b = _nucTup[ord(seq[i+j])]
+            if b is None:
+                i += j + 1
+                j = 0
+                x = 0
+                xb = 0
+            else:
+                x = (x << 2) | b
+                xb = (xb >> 2) | ((3 - b) << s)
+                j += 1
+        if j == k:
+            x &= msk
+            yield x
+            if bothStrands:
+                yield xb
+            j -= 1
+        i += 1
+
+def kmersLists(k, seq):
+    """
+    Extract *k*-mers from a string nucleotide sequence `seq` and
+    return the forward and reverse complement k-mers in separate
+    lists.
+
+    The *k*-mers are extracted using a *sliding* window, not a
+    *tiling* window.  This means that the results include the *k*-mer
+    starting at each position in the string:
+        0, 1, 2, ...., len(str) - k + 1.
+
+    Any *k*-mers overlaying characters *other* than AaCcGgTtUu are
+    skipped.
+
+    Values of `k` > 30 are not guaranteed to work.
+    """
+    z = len(seq)
+    msk = (1 << (2*k)) - 1
+    s = 2*(k-1)
+    i = 0
+    j = 0
+    x = 0
+    xb = 0
+    resFwd = []
+    resRev = []
+    while i + k <= z:
+        while i + j < z and j < k:
+            b = _nucTup[ord(seq[i+j])]
+            if b is None:
+                i += j + 1
+                j = 0
+                x = 0
+                xb = 0
+            else:
+                x = (x << 2) | b
+                xb = (xb >> 2) | ((3 - b) << s)
+                j += 1
+        if j == k:
+            x &= msk
+            resFwd.append(x)
+            resRev.append(xb)
+            j -= 1
+        i += 1
+    return (resFwd, resRev)
+
+def render(k, x):
+    "Turn an integer k-mer `x` into a string"
+    r = []
+    for i in range(k):
+        r.append("ACGT"[x&3])
+        x >>= 2
+    return ''.join(r[::-1])
+
+def entropy(k, x):
+    cts = [0, 0, 0, 0]
+    for i in range(k):
+        cts[x&3] += 1
+        x >>= 2
+    e = 0.0
+    t = sum(cts)
+    for c in cts:
+        if c == 0:
+            continue
+        p = float(c)/float(t)
+        e += -math.log2(p)
+    return e
+
+def smart_open(filename, mode="rt"):
+    if filename == "-":
+        if 'r' in mode:
+            return sys.stdin
+        elif 'w' in mode:
+            return sys.stdout
+        else:
+            raise SmartOpenError(f"unable to open '-' in mode '{mode}'")
+
+    if filename.endswith(".gz"):
+        return gzip.open(filename, mode)
+
+    return open(filename, mode)
+
+def pull_genes(args):
+
+    if verbose:
+        print(f"reading annoation from: {args['<annotation>']}", file=sys.stderr)
+
+    R = None
+    if args['--regions']:
+        if verbose:
+            print(f"regions used: {args['--regions']}", file=sys.stderr)
+        R = regions(args['--regions'])
+
+    S = None
+    if args['--sample']:
+        if verbose:
+            print(f"sampling transcripts with seed={args['--seed']}, and probability={args['--sample']}", file=sys.stderr)
+        S = sampler(args['--seed'], float(args['--sample']))
+        
+    lab_txt = "{gene_id} {gene_name}"
+    if args['--label']:
+        lab_txt = args['--label']
+    L = labeller(lab_txt)
+
+    genes = {}
+    for f in read_gtf(smart_open(args['<annotation>'])):
+        if f.type != "gene":
+            continue
+        if R:
+            loc = (f.chrom, f.start, f.end)
+            if loc not in R:
+                continue
+        if f.chrom not in genes:
+            genes[f.chrom] = []
+        if S and not S[f.attributes['gene_id']]:
+            continue
+        genes[f.chrom].append(f)
+
+    if verbose:
+        print(f"reading genome from: {args['<genome>']}", file=sys.stderr)
+        print(f"writing genes to: {args['--output']}", file=sys.stderr)
+
+    with smart_open(args['<genome>']) as ref, smart_open(args['--output'], "wt") as out:
+        for r in readFasta(ref):
+            chrom = r[0].strip().split()[0]
+            if verbose:
+                print(f"scanning {chrom}", file=sys.stderr)
+            if chrom not in exons:
+                continue
+            seen = set([])
+            for ftr in exons[chrom]:
+                v = (ftr.start, ftr.end)
+                if v in seen:
+                    continue
+                seen.add(v)
+                print(f">{L[ftr]}", file=out)
+                print(r[1][ftr.start - 1 : ftr.end].upper(), file=out)
+
+def pull_exons(args):
+
+    if verbose:
+        print(f"reading annoation from: {args['<annotation>']}", file=sys.stderr)
+
+    R = None
+    if args['--regions']:
+        if verbose:
+            print(f"regions used: {args['--regions']}", file=sys.stderr)
+        R = regions(args['--regions'])
+
+    S = None
+    if args['--sample']:
+        if verbose:
+            print(f"sampling transcripts with seed={args['--seed']}, and probability={args['--sample']}", file=sys.stderr)
+        S = sampler(args['--seed'], float(args['--sample']))
+        
+    lab_txt = "{exon_id} {transcript_id} {gene_id} {gene_name}"
+    if args['--label']:
+        lab_txt = args['--label']
+    L = labeller(lab_txt)
+
+    exons = {}
+    for f in read_gtf(smart_open(args['<annotation>'])):
+        if f.type != "exon":
+            continue
+        if R:
+            loc = (f.chrom, f.start, f.end)
+            if loc not in R:
+                continue
+        if f.chrom not in exons:
+            exons[f.chrom] = []
+        if S and not S[f.attributes['transcript_id']]:
+            continue
+        exons[f.chrom].append(f)
+
+    if verbose:
+        print(f"reading genome from: {args['<genome>']}", file=sys.stderr)
+        print(f"writing exons to: {args['--output']}", file=sys.stderr)
+
+    with smart_open(args['<genome>']) as ref, smart_open(args['--output'], "wt") as out:
+        for r in readFasta(ref):
+            chrom = r[0].strip().split()[0]
+            if verbose:
+                print(f"scanning {chrom}", file=sys.stderr)
+            if chrom not in exons:
+                continue
+            seen = set([])
+            for ftr in exons[chrom]:
+                v = (ftr.start, ftr.end)
+                if v in seen:
+                    continue
+                seen.add(v)
+                print(f">{L[ftr]}", file=out)
+                print(r[1][ftr.start - 1 : ftr.end].upper(), file=out)
+
+def pull_filter(args):
+
+    K = int(args['-K'])
+
+    C = None
+    if args['--max-count']:
+        C = int(args['--max-count'])
+
+    E = None
+    if args['--entropy']:
+        E = float(args['--entropy'])
+
+    if verbose:
+        print(f"reading sequences from: {args['<sequences>']}", file=sys.stderr)
+
+    with smart_open(args['<sequences>']) as seqsfile:
+        seqs = list(readFasta(seqsfile))
+
+    pruned = set([])
+    idx = {}
+    for (nm,seq) in seqs:
+        for x in kmers(K, seq, True):
+            if E and entropy(K, x)/K < E:
+                if verbose and x not in pruned:
+                    print(f"pruning low entropy kmer {render(K, x)} ({entropy(K, x)/K})", file=sys.stderr)
+                pruned.add(x)
+                continue
+            idx[x] = 0
+
+    if C is not None and args['--genome']:
+
+        if verbose:
+            print(f"reading genome from: {args['--genome']}", file=sys.stderr)
+
+        with smart_open(args['--genome']) as ref:
+            for r in readFasta(ref):
+                chrom = r[0].strip().split()[0]
+                if verbose:
+                    print(f"scanning {chrom}", file=sys.stderr)
+                for x in kmers(K, r[1], False):
+                    if x not in idx:
+                        continue
+                    idx[x] += 1
+
+        if args['--histogram']:
+            h = {}
+            for x in idx.keys():
+                c = idx[x]
+                if c not in h:
+                    h[c] = 0
+                h[c] += 1
+            with smart_open(args['--histogram'], "wt") as hist:
+                print("frequency\tcount", file=hist)
+                for (f,c) in sorted(h.items()):
+                    print(f"{f}\t{c}", file=hist)
+
+        for x in sorted(idx.keys()):
+            if idx[x] > C:
+                pruned.add(x)
+                if verbose:
+                    print(f"pruning high frequency kmer {render(K, x)} ({idx[x]})", file=sys.stderr)
+                del idx[x]
+
+    with smart_open(args['--output'], "wt") as out:
+        for (nm, seq) in seqs:
+            res = [seq[i] for i in range(len(seq))]
+            for i in range(len(seq) - K + 1):
+                for x in kmers(K, seq[i:i+K], True):
+                    if x in pruned:
+                        for j in range(i, i+K):
+                            res[j] = 'N'
+            res = ''.join(res)
+            print(f">{nm}", file=out)
+            print(f"{res}", file=out)
+
+def pull_read_pairs(args):
+
+    K = int(args['-K'])
+
+    if verbose:
+        print(f"reading sequences from: {args['<baits>']}", file=sys.stderr)
+
+    wanted = set([])
+    with smart_open(args['<baits>']) as baits:
+        for (nm, seq) in readFasta(baits):
+            (fwd, rev) = kmersLists(K, seq)
+            wanted |= set(fwd)
+
+    stats = {}
+    outfn1 = f"{args['<output-prefix>']}1{args['--suffix']}"
+    outfn2 = f"{args['<output-prefix>']}2{args['--suffix']}"
+    with smart_open(outfn1, "wt") as out1, smart_open(outfn2, "wt") as out2:
+        rn = 0
+        for (infn1, infn2) in zip(args['<fastq1>'], args['<fastq2>']):
+            if verbose:
+                print(f"reading '{infn1}' & '{infn2}'", file=sys.stderr)
+            theseStats = {}
+            with smart_open(infn1, "rt") as in1, smart_open(infn2, "rt") as in2:
+                for (lhs, rhs) in zip(readFastq(in1), readFastq(in2)):
+                    (lhsFwd, lhsRev) = kmersLists(K, lhs[1])
+                    (rhsFwd, rhsRev) = kmersLists(K, rhs[1])
+                    lhsFwdCount = len(set(lhsFwd) & wanted)
+                    lhsRevCount = len(set(lhsRev) & wanted)
+                    rhsFwdCount = len(set(rhsFwd) & wanted)
+                    rhsRevCount = len(set(rhsRev) & wanted)
+                    if lhsFwdCount + lhsRevCount + rhsFwdCount + rhsRevCount > 0:
+                        writeFastq(out1, lhs)
+                        writeFastq(out2, rhs)
+                    v = (lhsFwdCount, lhsRevCount, rhsFwdCount, rhsRevCount)
+                    if v not in theseStats:
+                        theseStats[v] = 1
+                    else:
+                        theseStats[v] += 1
+                    rn += 1
+            w = (infn1, infn2)
+            stats[w] = theseStats
+
+    if args['--stats']:
+        with smart_open(args['--stats'], "wt") as statsOut:
+            print("source\tlhsFwd\tlhsRev\trhsFwd\trhsRev\tcount", file=statsOut)
+            for k in sorted(stats.keys()):
+                (fn1, fn2) = k
+                w = lcp(fn1, fn2)
+                # ignore trailing _ characters:
+                while len(w) and w[-1] == '_':
+                    w = w[:-1]
+                for (tup, cnt) in sorted(stats[k].items()):
+                    print('\t'.join([w] + list(map(str, list(tup) + [cnt]))), file=statsOut)
+
+def main(args):
+    global verbose
+    verbose = args['--verbose']
+
+    if args['genes']:
+        pull_genes(args)
+    if args['exons']:
+        pull_exons(args)
+    if args['filter']:
+        pull_filter(args)
+    if args['read-pairs']:
+        pull_read_pairs(args)
+
+if __name__ == '__main__':
+    args = docopt.docopt(__doc__, version='pully 0.1')
+    main(args)
+# vim: set ft=python:
